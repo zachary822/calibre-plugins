@@ -47,15 +47,11 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         self.device_model = None  # 'X3' | 'X4' from /api/status
         self.last_discovery = 0.0
         self.report_progress = lambda x, y: x
-        self._debug_enabled = False
+        self._optimizer_job_log = None
+        self._optimizer_job = None
 
     def _log(self, message):
         add_log(message)
-        if self._debug_enabled:
-            try:
-                self.report_progress(0.0, message)
-            except Exception:
-                pass
 
     # Device discovery / presence
     def _discover(self):
@@ -77,7 +73,6 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         if self.is_connected:
             return self
         debug = PREFS['debug']
-        self._debug_enabled = debug
         if debug:
             self._log('[CrossPoint] detect_managed_devices')
         host, port = self._discover()
@@ -150,6 +145,50 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         else:
             self.report_progress = report_progress
 
+    def _start_optimizer_job_log(self, book_count, profile):
+        """Attach optimizer output to Calibre's current device job.
+
+        Device drivers receive ``DeviceJob.report_progress`` as their public
+        progress callback. Calibre does not expose a separate details writer
+        through the device-plugin API, but the bound ``DeviceJob`` stores the
+        text shown by *Show job details* in ``_details``. Keep that buffer in
+        sync while continuing to use the callback for live status updates.
+        """
+        job = getattr(self.report_progress, '__self__', None)
+        self._optimizer_job = job if hasattr(job, '_details') else None
+        self._optimizer_job_log = [
+            'CrossPoint EPUB optimizer',
+            'Optimizing %d book(s) for %s' % (book_count, profile),
+            '',
+        ]
+        self._publish_optimizer_job_log()
+
+    def _publish_optimizer_job_log(self):
+        if self._optimizer_job is not None and self._optimizer_job_log is not None:
+            self._optimizer_job._details = '\n'.join(self._optimizer_job_log)
+
+    def _append_optimizer_job_log(self, tag, message, progress=None, status=None):
+        if self._optimizer_job_log is None:
+            return
+        add_log('[CrossPoint][opt] %s: %s' % (tag, message))
+        self._optimizer_job_log.append('[%s] %s' % (tag, message))
+        self._publish_optimizer_job_log()
+        if status is not None:
+            try:
+                self.report_progress(progress if progress is not None else 0.0, status)
+            except Exception:
+                pass
+
+    def _finish_optimizer_job_log(self, profile, summaries):
+        if self._optimizer_job_log is None:
+            return
+        from .summary import summary_lines
+        self._optimizer_job_log.extend(summary_lines({
+            'profile': profile,
+            'books': summaries,
+        }))
+        self._publish_optimizer_job_log()
+
     def _http_base(self):
         host = self.device_host or PREFS['host']
         return f'http://{host}'
@@ -186,12 +225,6 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
             raise ControlError(desc=f'HTTP request failed: {exc}')
 
     def config_widget(self):
-        # Runs on the GUI thread; ensure the summary bridge exists (idempotent).
-        try:
-            from . import summary as summary_ui
-            summary_ui.ensure_bridge()
-        except Exception:
-            pass
         return CrossPointConfigWidget()
 
     def save_settings(self, config_widget):
@@ -427,18 +460,10 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
 
         optimize_enabled = bool(PREFS['optimize'])
         opt_profile = None
-        summary_ui = None
         if optimize_enabled:
             from .optimizer import resolve_profile
             _, opt_profile = resolve_profile(PREFS['device_target'], self.device_model)
-            # Open the live optimizer dialog up-front so the user sees steps stream.
-            try:
-                from . import summary as summary_ui
-                summary_ui.begin('Optimizing %d book(s) for %s…' % (
-                    len(files), opt_profile['label']))
-            except Exception as exc:
-                summary_ui = None
-                self._log(f'[CrossPoint] could not open optimizer dialog: {exc}')
+            self._start_optimizer_job_log(len(files), opt_profile['label'])
 
         paths = []
         summaries = []
@@ -469,15 +494,25 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
             send_path = filepath
             opt_temp = None
             if optimize_enabled and filepath.lower().endswith('.epub'):
-                step_cb = summary_ui.step if summary_ui is not None else None
+                def step_cb(tag, message):
+                    self._append_optimizer_job_log(
+                        tag, message,
+                        progress=i / float(total),
+                        status='Optimizing book %d of %d (%s)...' % (
+                            i + 1, total, tag),
+                    )
+
                 opt_temp, summary = self._optimize_book(filepath, opt_profile,
                                                         step_cb=step_cb)
                 if opt_temp is not None:
                     send_path = opt_temp
                 if summary is not None:
                     summaries.append(summary)
-                if summary_ui is not None:
-                    summary_ui.step('SEND', 'Uploading %s …' % filename)
+                self._append_optimizer_job_log(
+                    'SEND', 'Uploading %s' % filename,
+                    progress=i / float(total),
+                    status='Uploading book %d of %d...' % (i + 1, total),
+                )
 
             def _progress(sent, size):
                 if size > 0:
@@ -529,9 +564,18 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
                             time.sleep(retry_delay)
 
                 if last_error is not None:
-                    raise ControlError(desc=f'Upload failed for {filename} after '
-                                      f'{max_attempts} attempt(s): {last_error}')
+                    error_message = ('Upload failed for %s after %d attempt(s): %s' % (
+                        filename, max_attempts, last_error))
+                    if optimize_enabled and filepath.lower().endswith('.epub'):
+                        self._append_optimizer_job_log('ERROR', error_message)
+                        # DeviceJob replaces its details with the exception on
+                        # failure, so include the accumulated optimizer output.
+                        error_message += '\n\nOptimizer log:\n' + '\n'.join(
+                            self._optimizer_job_log)
+                    raise ControlError(desc=error_message)
                 paths.append((lpath, os.path.getsize(send_path)))
+                if optimize_enabled and filepath.lower().endswith('.epub'):
+                    self._append_optimizer_job_log('SENT', '%s uploaded' % filename)
                 if book_cooldown > 0 and i + 1 < total:
                     time.sleep(book_cooldown)
             finally:
@@ -541,23 +585,17 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
                     except OSError:
                         pass
 
-        self.report_progress(1.0, 'Transferring books to device...')
-
-        if summary_ui is not None:
-            try:
-                summary_ui.finish({
-                    'profile': opt_profile['label'] if opt_profile else '?',
-                    'books': summaries,
-                })
-            except Exception as exc:
-                self._log(f'[CrossPoint] could not finalize optimizer dialog: {exc}')
+        if optimize_enabled:
+            self._finish_optimizer_job_log(
+                opt_profile['label'] if opt_profile else '?', summaries)
+        self.report_progress(1.0, 'Finished transferring books to device.')
 
         return paths
 
     def _optimize_book(self, filepath, profile, step_cb=None):
         """Optimize an EPUB to a temp file. Returns (temp_path_or_None, summary_or_None).
 
-        ``step_cb(tag, message)`` (optional) streams each step to the live dialog.
+        ``step_cb(tag, message)`` (optional) streams each step to the Calibre job.
         On any failure the original file is used (temp_path is None) so a transfer
         is never blocked by optimization.
         """
@@ -572,12 +610,13 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
         )
 
         def _step(tag, message):
-            self._log(f'[CrossPoint][opt] {tag}: {message}')
             if step_cb is not None:
                 try:
                     step_cb(tag, message)
                 except Exception:
-                    pass
+                    self._log(f'[CrossPoint][opt] {tag}: {message}')
+            else:
+                self._log(f'[CrossPoint][opt] {tag}: {message}')
 
         out_path = None
         try:
@@ -587,8 +626,9 @@ class CrossPointDevice(DeviceConfig, DevicePlugin):
             summary = optimize_epub(filepath, out_path, profile, opts, log_fn=_step)
             return out_path, summary
         except Exception as exc:
-            self._log(f'[CrossPoint] optimization failed for {os.path.basename(filepath)}: '
-                      f'{exc} (sending original)')
+            message = '%s: %s (sending original)' % (
+                os.path.basename(filepath), exc)
+            _step('ERROR', 'Optimization failed for ' + message)
             if out_path:
                 try:
                     os.remove(out_path)

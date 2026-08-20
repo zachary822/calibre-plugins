@@ -139,7 +139,8 @@ class CrossPointConfigWidget(QWidget):
         layout.addRow(opt_heading)
         opt_notice = QLabel('Mirrors the CrossPoint web optimizer: resizes images to the '
                             'screen, converts to grayscale and re-encodes as JPEG, then '
-                            'rewrites the EPUB. A summary is shown after each transfer.')
+                            'rewrites the EPUB. Progress and logs are shown in the Calibre '
+                            'Jobs entry for the transfer.')
         opt_notice.setWordWrap(True)
         opt_notice.setStyleSheet('color: gray; font-style: italic;')
         layout.addRow('', opt_notice)
